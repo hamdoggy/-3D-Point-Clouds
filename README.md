@@ -133,24 +133,4 @@ python question_3.py
 
 This script will perform feature extraction using a pre-trained model, mask some labels to simulate unlabelled data, and propagate labels using cosine similarity.
 
-### Pseudo-Labeling and Enhanced Training
 
-To perform pseudo-labeling and enhance model training, use `question_4.py`:
-
-```bash
-python question_4.py
-```
-
-This script will use k-means clustering to generate pseudo-labels for unlabelled data and train the model with augmented data and advanced techniques.
-
-## Contributing
-
-If you would like to contribute to this project, please fork the repository and submit a pull request with your changes.
-
-## License
-
-This project is licensed under the MIT License.
-
----
-
-If you have any questions or need further assistance, feel free to contact the project maintainer.
