@@ -1,0 +1,305 @@
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, TensorDataset, random_split
+import os
+from glob import glob
+import plotly.express as px
+import plotly.graph_objects as go
+from torch.utils.tensorboard import SummaryWriter
+from tqdm import tqdm
+import matplotlib.pyplot as plt
+
+label_descriptions = {
+    1: "unground",
+    22: "ground"
+}
+
+# 解析点云数据
+def load_point_cloud(bin_file):
+    points = np.fromfile(bin_file, dtype=np.float32)
+    points = points.reshape(-1, 4)  # 假设每个点包含 x, y, z 和强度
+    return points
+
+
+# 解析标签文件
+def load_labels(label_file):
+    labels = np.fromfile(label_file, dtype=np.uint32)
+    instance_ids = labels >> 16
+    class_labels = labels & 0xFFFF
+    class_labels = class_labels.astype(np.int64)
+    return instance_ids, class_labels
+
+
+# 预处理数据
+def preprocess_data(point_cloud, instance_ids, class_labels):
+    data = pd.DataFrame(point_cloud, columns=['x', 'y', 'z', 'intensity'])
+    data['instance_id'] = instance_ids
+    # 将 22 映射为 1，将 1 映射为 0
+    data['class_label'] = np.where(class_labels == 22, 1, 0)
+    data['distance'] = np.linalg.norm(data[['x', 'y', 'z']], axis=1)
+    return data
+
+
+# 定义 PointNet 模型
+class PointNet(nn.Module):
+    def __init__(self):
+        super(PointNet, self).__init__()
+        self.fc1 = nn.Linear(5, 64)
+        self.bn1 = nn.BatchNorm1d(64)
+        self.fc2 = nn.Linear(64, 128)
+        self.bn2 = nn.BatchNorm1d(128)
+        self.fc3 = nn.Linear(128, 256)
+        self.bn3 = nn.BatchNorm1d(256)
+        self.fc4 = nn.Linear(256, 128)
+        self.bn4 = nn.BatchNorm1d(128)
+        self.fc5 = nn.Linear(128, 2)
+
+    def forward(self, x):
+        x = torch.relu(self.bn1(self.fc1(x)))
+        x = torch.relu(self.bn2(self.fc2(x)))
+        x = torch.relu(self.bn3(self.fc3(x)))
+        x = torch.relu(self.bn4(self.fc4(x)))
+        x = self.fc5(x)
+        return x
+
+
+# 训练模型
+# 训练模型
+def train_model(dataloader, num_classes, num_epochs, device, learning_rate=0.005):
+    model = PointNet().to(device)
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+
+    # Initialize TensorBoard writer
+    writer = SummaryWriter(log_dir='runs/training')
+
+    epoch_losses = []
+
+    for epoch in range(num_epochs):
+        model.train()
+        running_loss = 0.0
+        for batch_idx, (inputs, labels) in enumerate(
+                tqdm(dataloader, desc=f'Epoch {epoch + 1}/{num_epochs}', unit='batch')):
+            inputs, labels = inputs.to(device), labels.to(device)
+            optimizer.zero_grad()
+            outputs = model(inputs)
+            loss = criterion(outputs, labels)
+            loss.backward()
+            optimizer.step()
+
+            running_loss += loss.item()
+
+            # Log loss every 10 batches
+            if batch_idx % 10 == 0:
+                writer.add_scalar('Loss/Batch', loss.item(), epoch * len(dataloader) + batch_idx)
+
+        # Log average loss for this epoch
+        avg_loss = running_loss / len(dataloader)
+        epoch_losses.append(avg_loss)
+        writer.add_scalar('Loss/Epoch', avg_loss, epoch)
+
+        print(f'Epoch [{epoch + 1}/{num_epochs}], Loss: {avg_loss:.4f}')
+
+    writer.close()
+    print("Training completed.")
+
+    # Plotting the loss
+    plt.figure()
+    plt.plot(range(1, num_epochs + 1), epoch_losses, marker='o')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.title('Training Loss Over Epochs')
+    plt.grid(True)
+    plt.savefig('training_loss.png')  # Save the figure
+    plt.show()  # Display the figure
+
+    return model
+
+
+# 测试模型并保存帧图像
+# 计算 IOU
+def compute_iou(pred, target, num_classes):
+    ious = []
+    for cls in range(num_classes):
+        pred_inds = pred == cls
+        target_inds = target == cls
+        intersection = (pred_inds & target_inds).sum().item()
+        union = (pred_inds | target_inds).sum().item()
+        if union == 0:
+            ious.append(float('nan'))
+        else:
+            ious.append(intersection / union)
+    return np.array(ious)
+
+
+# 计算 Dice 系数
+def compute_dice(pred, target, num_classes):
+    dices = []
+    for cls in range(num_classes):
+        pred_inds = pred == cls
+        target_inds = target == cls
+        intersection = (pred_inds & target_inds).sum().item()
+        pred_sum = pred_inds.sum().item()
+        target_sum = target_inds.sum().item()
+
+        # Ensure denominator is not zero
+        if pred_sum + target_sum == 0:
+            dices.append(float('nan'))
+        else:
+            dice = (2 * intersection) / (pred_sum + target_sum)
+            dices.append(dice)
+    return np.array(dices)
+
+
+# 测试模型并保存帧图像
+def test_model_and_save_frames(model, test_files, device, output_dir, batch_size=512):
+    model.eval()
+    os.makedirs(output_dir, exist_ok=True)
+
+    frame_counter = 0
+    correct = 0
+    total = 0
+    ious = []
+    dices = []
+    with torch.no_grad():
+        for bin_file, label_file in tqdm(test_files, desc='Testing', unit='file'):
+            point_cloud = load_point_cloud(bin_file)
+            instance_ids, class_labels = load_labels(label_file)
+            data = preprocess_data(point_cloud, instance_ids, class_labels)
+
+            dataset = TensorDataset(
+                torch.tensor(data[['x', 'y', 'z', 'intensity', 'distance']].values, dtype=torch.float32),
+                torch.tensor(data['class_label'].values, dtype=torch.long))
+            dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False,pin_memory=True)
+
+            all_predictions = []
+            all_targets = []
+            for inputs, labels in dataloader:
+                inputs, labels = inputs.to(device), labels.to(device)
+                outputs = model(inputs)
+                _, predicted = torch.max(outputs.data, 1)
+                all_predictions.append(predicted.cpu().numpy())
+                all_targets.append(labels.cpu().numpy())
+                total += labels.size(0)
+                correct += (predicted == labels).sum().item()
+
+            all_predictions = np.concatenate(all_predictions)
+            all_targets = np.concatenate(all_targets)
+            frame_path = os.path.join(output_dir, f'frame_{frame_counter:06d}.html')
+            # visualize_point_cloud_with_labels(data[['x', 'y', 'z', 'intensity']].values, all_predictions, frame_path)
+            visualize_point_cloud_with_labels(point_cloud, all_predictions, frame_path)
+            frame_counter += 1
+
+            # 计算当前帧的 IOU 和 Dice 系数
+            iou = compute_iou(all_predictions, all_targets, model.fc5.out_features)
+            dice = compute_dice(all_predictions, all_targets, model.fc5.out_features)
+            ious.append(iou)
+            dices.append(dice)
+
+    mean_ious = np.nanmean(np.array(ious), axis=0)
+    mean_dices = np.nanmean(np.array(dices), axis=0)
+    for cls in range(model.fc5.out_features):
+        print(f"Class {cls} IOU: {mean_ious[cls]:.4f}")
+        print(f"Class {cls} Dice: {mean_dices[cls]:.4f}")
+    print(f"Mean IOU: {np.nanmean(mean_ious):.4f}")
+    print(f"Mean Dice: {np.nanmean(mean_dices):.4f}")
+    print(f"Accuracy: {100 * correct / total:.2f}%")
+
+# 可视化点云数据和标签
+def visualize_point_cloud_with_labels(point_cloud, class_labels, output_file):
+    df = pd.DataFrame(point_cloud, columns=['x', 'y', 'z', 'intensity'])
+    df['class'] = class_labels.astype(str)
+
+    # 使用 Plotly Express 创建 3D 散点图
+    fig = px.scatter_3d(df, x='x', y='y', z='z', color='class', color_discrete_sequence=px.colors.qualitative.Alphabet,
+                        opacity=0.7)
+    fig.update_traces(marker=dict(size=2))  # 设置点的大小
+
+    # 创建一个新的图形对象来调整图例标记的大小
+    fig_legend = go.Figure()
+
+    for trace in fig.data:
+        fig_legend.add_trace(go.Scatter3d(
+            x=trace['x'],
+            y=trace['y'],
+            z=trace['z'],
+            mode='markers',
+            marker=dict(size=2),
+            name=trace['name']
+        ))
+
+    # 调整右侧颜色和文字大小
+    fig_legend.update_layout(
+        scene=dict(aspectmode='data'),
+        legend=dict(
+            title=dict(font=dict(size=20)),  # 修改标题大小
+            font=dict(size=15),  # 修改图例文本大小
+            itemsizing='constant'  # 确保图例中的标记大小一致
+        )
+    )
+
+    # 增加图例中标记的大小
+    for trace in fig_legend['data']:
+        trace['marker']['size'] = 2  # 设置图例中标记的大小
+
+    # 保存 HTML 文件
+    fig_legend.write_html(output_file)
+
+
+
+# 主函数
+def main(bin_dir, label_dir, num_epochs, batch_size=4096, num_workers=96, output_dir='E:\code\spotclould\output_picture'):
+    bin_files = sorted(glob(os.path.join(bin_dir, '*.bin')))
+    label_files = sorted(glob(os.path.join(label_dir, '*.label')))
+
+    assert len(bin_files) == len(label_files), "The number of bin files and label files must be the same."
+
+
+
+    data_files = list(zip(bin_files, label_files))
+    train_size = int(0.8 * len(data_files))
+    train_files = data_files[:train_size]
+    test_files = data_files[train_size:]
+
+    all_train_data = []
+    for bin_file, label_file in train_files:
+        point_cloud = load_point_cloud(bin_file)
+        instance_ids, class_labels = load_labels(label_file)
+        data = preprocess_data(point_cloud, instance_ids, class_labels)
+        all_train_data.append(data)
+
+    all_train_data = pd.concat(all_train_data, ignore_index=True)
+
+    unique_labels = np.unique(all_train_data['class_label'])
+    print(f"Unique class labels: {unique_labels}")
+    print(f"Max class label: {unique_labels.max()}")
+
+    num_classes = unique_labels.max() + 1
+    print(f"Number of classes: {num_classes}")
+
+    X = all_train_data[['x', 'y', 'z', 'intensity', 'distance']].values
+    y = all_train_data['class_label'].values
+
+
+    dataset = TensorDataset(torch.tensor(X, dtype=torch.float32), torch.tensor(y, dtype=torch.long))
+    train_dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=True)
+
+    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+    print(device)
+    model = train_model(train_dataloader, num_classes, num_epochs, device)
+
+    print("Saving trained model...")
+    torch.save(model, 'trained_model.pth')
+
+    print("Testing model on test dataset...")
+    test_model_and_save_frames(model, test_files, device, output_dir, batch_size)
+
+    return model
+
+
+if __name__ == '__main__':
+    model = main(r'E:\code\spotclould\三维点云数据集\dataset\sequences\00\velodyne', r'E:\code\spotclould\三维点云数据集\dataset\sequences\00\labels', num_epochs=1, batch_size=128,
+                 num_workers=16, output_dir='predict_frames')
