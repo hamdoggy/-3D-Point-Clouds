@@ -27,7 +27,6 @@ This project aims to process and segment point cloud data using a combination of
 ├── question_1.py
 ├── question_2.py
 ├── question_3.py
-├── question_4.py
 ├── read_data.py
 ├── test.py
 ├── test_1.py
@@ -39,9 +38,6 @@ This project aims to process and segment point cloud data using a combination of
 ├── test_csv3.py
 ├── test_csv4.py
 ├── trained_model.pth
-├── 全数据ks检验.py
-├── 预测结果_1.csv
-├── 预测结果_2.csv
 ```
 
 ## Requirements
